@@ -22,6 +22,9 @@ st.set_page_config(
 SHEETS_URL = "https://docs.google.com/spreadsheets/d/1PpiMQingHf4llA03BiPIuPJPIZqul4grRU_emWDEK1o/export?format=csv"
 WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxTX9uUWnByw6sk6MtuJ5FbjV7zeBKYEoUPPlUlUDS738QqocfCd_NAlh9Eh25XhQywTw/exec"
 
+# 🔁 Planilha de TEMPLATE com a aba estrutura_produto
+ESTRUTURA_URL = "https://docs.google.com/spreadsheets/d/1QQnfT9nogAQM9d-D33ivkhGJawxiJK9ZC11UuF3bOj8/gviz/tq?tqx=out:csv&sheet=estrutura_produto"
+
 # ======================
 # HELPERS ROBUSTOS
 # ======================
@@ -108,6 +111,55 @@ def carregar_produtos():
 
     except Exception as e:
         st.error(f"Erro ao carregar dados da planilha: {e}")
+        return pd.DataFrame()
+
+# ======================
+# CARREGAR ESTRUTURA DE PRODUTO (template_estoque)
+# ======================
+@st.cache_data(ttl=30)
+def carregar_estrutura_produto():
+    """
+    Lê a aba estrutura_produto da planilha template_estoque.
+    Esperado (podem vir com variação de nome, tratamos):
+      - codigo_produto
+      - semi_codigo
+      - gola_codigo
+      - bordado_codigo
+      - componentes_codigos
+      - qtde (qtd de produto final por linha)
+    """
+    try:
+        r = requests.get(ESTRUTURA_URL, timeout=15)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text))
+
+        # Normaliza nomes das colunas
+        cols_norm = {}
+        for c in df.columns:
+            base = unicodedata.normalize('NFKD', str(c)).encode('ASCII', 'ignore').decode('ASCII')
+            low = base.lower().strip()
+            if 'codigo_produto' in low or low.startswith('codigo ') or low.startswith('produto'):
+                cols_norm[c] = 'codigo_produto'
+            elif 'semi' in low and 'codigo' in low:
+                cols_norm[c] = 'semi_codigo'
+            elif 'gola' in low and 'codigo' in low:
+                cols_norm[c] = 'gola_codigo'
+            elif 'bordado' in low and 'codigo' in low:
+                cols_norm[c] = 'bordado_codigo'
+            elif 'component' in low:
+                cols_norm[c] = 'componentes_codigos'
+            elif low.startswith('qt') or 'qtd' in low:
+                cols_norm[c] = 'qtde'
+        df = df.rename(columns=cols_norm)
+
+        for col in ['codigo_produto', 'semi_codigo', 'gola_codigo',
+                    'bordado_codigo', 'componentes_codigos', 'qtde']:
+            if col not in df.columns:
+                df[col] = ""
+
+        return df
+    except Exception as e:
+        st.error(f"Erro ao carregar aba 'estrutura_produto' do template: {e}")
         return pd.DataFrame()
 
 # ======================
@@ -331,7 +383,15 @@ status_filtro = st.sidebar.selectbox("🚦 Status", status_opcoes)
 
 tipo_analise = st.sidebar.radio(
     "Tipo de Análise",
-    ["Visão Geral", "Análise Mín/Máx", "Movimentação", "Baixa por Faturamento", "Histórico de Baixas", "Relatório de Faltantes"]
+    [
+        "Visão Geral",
+        "Análise Mín/Máx",
+        "Movimentação",
+        "Baixa por Faturamento",
+        "Histórico de Baixas",
+        "Relatório de Faltantes",
+        "Estrutura de Produto"
+    ]
 )
 
 df_filtrado = produtos_df.copy()
@@ -682,6 +742,176 @@ elif tipo_analise == "Relatório de Faltantes":
 
         except Exception as e:
             st.error(f"Erro ao processar: {e}")
+
+# ======================
+# ESTRUTURA DE PRODUTO (NOVA ABA)
+# ======================
+elif tipo_analise == "Estrutura de Produto":
+    st.subheader("Estrutura de Produto (BOM)")
+
+    st.markdown("""
+    Esta visão cruza a aba <b>estrutura_produto</b> do template de estoque
+    com o estoque real da fábrica, para responder:
+    <ul>
+      <li>Quantas peças finais cada estrutura permite produzir hoje?</li>
+      <li>Quais componentes estão limitando a produção (gargalos)?</li>
+      <li>Quais códigos de Semi / Gola / Bordado / extras não estão cadastrados no estoque?</li>
+    </ul>
+    """, unsafe_allow_html=True)
+
+    estrutura_df = carregar_estrutura_produto()
+
+    if estrutura_df.empty:
+        st.warning("A aba 'estrutura_produto' não retornou dados. Confirme o template.")
+    else:
+        busca = st.text_input("🔍 Filtrar produto final (código ou nome)", "")
+
+        # Monta linhas de componentes por produto
+        linhas_comp = []
+        for _, row in estrutura_df.iterrows():
+            cod_prod = str(row.get('codigo_produto', '')).strip()
+            if not cod_prod:
+                continue
+
+            q_base = safe_int(row.get('qtde', 1), 1)
+            if q_base <= 0:
+                q_base = 1
+
+            entradas = []
+
+            semi = str(row.get('semi_codigo', '')).strip()
+            if semi:
+                entradas.append(("Semi", semi))
+
+            gola = str(row.get('gola_codigo', '')).strip()
+            if gola:
+                entradas.append(("Gola", gola))
+
+            bordado = str(row.get('bordado_codigo', '')).strip()
+            if bordado:
+                entradas.append(("Bordado", bordado))
+
+            extras_raw = str(row.get('componentes_codigos', '')).strip()
+            if extras_raw:
+                for c in extras_raw.split(','):
+                    c = c.strip()
+                    if c:
+                        entradas.append(("Componente extra", c))
+
+            for tipo_comp, cod_comp in entradas:
+                linhas_comp.append({
+                    'codigo_produto': cod_prod,
+                    'tipo_componente': tipo_comp,
+                    'codigo_componente': cod_comp,
+                    'qtd_por_produto': q_base
+                })
+
+        if not linhas_comp:
+            st.info("Nenhuma linha válida encontrada na aba 'estrutura_produto'.")
+        else:
+            comp_df = pd.DataFrame(linhas_comp)
+
+            # Junta com estoque dos componentes
+            comp_df = comp_df.merge(
+                produtos_df[['codigo', 'nome', 'estoque_atual', 'status']],
+                left_on='codigo_componente',
+                right_on='codigo',
+                how='left'
+            )
+
+            comp_df['nome_componente'] = comp_df['nome'].fillna("(não cadastrado no estoque)")
+            comp_df['estoque_atual'] = pd.to_numeric(comp_df['estoque_atual'], errors='coerce').fillna(0).astype(int)
+            comp_df['status'] = comp_df['status'].fillna("N/D")
+
+            comp_df['capacidade_por_componente'] = comp_df.apply(
+                lambda r: (r['estoque_atual'] // r['qtd_por_produto']) if r['qtd_por_produto'] > 0 else 0,
+                axis=1
+            )
+
+            # Info do produto final
+            final_info = produtos_df[['codigo', 'nome', 'estoque_atual']].rename(
+                columns={
+                    'codigo': 'codigo_produto',
+                    'nome': 'produto_final',
+                    'estoque_atual': 'estoque_produto_final'
+                }
+            )
+
+            resumo = comp_df.groupby('codigo_produto', as_index=False).agg(
+                componentes_totais=('codigo_componente', 'count'),
+                capacidade_maxima=('capacidade_por_componente', 'min')
+            ).merge(final_info, on='codigo_produto', how='left')
+
+            resumo['estoque_produto_final'] = pd.to_numeric(
+                resumo['estoque_produto_final'], errors='coerce'
+            ).fillna(0).astype(int)
+            resumo['capacidade_maxima'] = resumo['capacidade_maxima'].fillna(0).astype(int)
+
+            # Filtro de busca
+            if busca:
+                mask = (
+                    resumo['codigo_produto'].astype(str).str.contains(busca, case=False, na=False) |
+                    resumo['produto_final'].astype(str).str.contains(busca, case=False, na=False)
+                )
+                resumo = resumo[mask]
+                comp_df = comp_df[comp_df['codigo_produto'].isin(resumo['codigo_produto'])]
+
+            if resumo.empty:
+                st.warning("Nenhum produto encontrado para esse filtro.")
+            else:
+                resumo_view = resumo[
+                    ['codigo_produto', 'produto_final', 'estoque_produto_final',
+                     'componentes_totais', 'capacidade_maxima']
+                ]
+                resumo_view.columns = [
+                    'Código Produto',
+                    'Produto Final',
+                    'Estoque Atual (Produto Final)',
+                    'Qtd Componentes',
+                    'Capacidade Máxima (peças possíveis)'
+                ]
+
+                st.markdown("### 📦 Capacidade por Produto Final")
+                st.dataframe(
+                    resumo_view.sort_values('Capacidade Máxima (peças possíveis)', ascending=False),
+                    use_container_width=True,
+                    height=380
+                )
+
+                st.download_button(
+                    "📥 Baixar resumo (CSV)",
+                    resumo_view.to_csv(index=False, encoding='utf-8-sig'),
+                    file_name=f"estrutura_resumo_{datetime.now():%Y%m%d_%H%M%S}.csv",
+                    mime="text/csv"
+                )
+
+                st.markdown("---")
+                st.markdown("### 🔍 Detalhamento por Componente")
+
+                det_view = comp_df[
+                    ['codigo_produto', 'tipo_componente', 'codigo_componente',
+                     'nome_componente', 'qtd_por_produto', 'estoque_atual',
+                     'capacidade_por_componente', 'status']
+                ]
+                det_view.columns = [
+                    'Código Produto',
+                    'Tipo',
+                    'Código Componente',
+                    'Componente',
+                    'Qtd por Produto',
+                    'Estoque Atual (Comp.)',
+                    'Capacidade pelo Componente',
+                    'Status Estoque'
+                ]
+
+                st.dataframe(det_view, use_container_width=True, height=420)
+
+                st.download_button(
+                    "📥 Baixar detalhamento (CSV)",
+                    det_view.to_csv(index=False, encoding='utf-8-sig'),
+                    file_name=f"estrutura_detalhada_{datetime.now():%Y%m%d_%H%M%S}.csv",
+                    mime="text/csv"
+                )
 
 # ======================
 # FOOTER
