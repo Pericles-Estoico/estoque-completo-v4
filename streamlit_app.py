@@ -1,614 +1,505 @@
+# streamlit_app.py
+# BOM Explosão (Produção) - Silva Holding
+# Regras:
+# 1) Se estoque suficiente do código pai -> NÃO explode
+# 2) Se faltar (demanda > estoque) -> explode SOMENTE o faltante
+# 3) Explode até insumos (Semi / Gola / Bordado / Extras / Componentes)
+# 4) Se insumo faltar -> entra em LISTA_ACAO = "FABRICAR"
+# 5) Não mostrar local -> apenas observação "PLATELEIRA ESTOQUE" quando faltar
+
+import io
 import os
-import json
 import re
-from io import BytesIO
+import json
+import math
+import time
+import pandas as pd
+import numpy as np
+import requests
+import streamlit as st
 from datetime import datetime
 
-import pandas as pd
-import streamlit as st
+APP_CONFIG_PATH = "app_config.json"
 
-APP_TITLE = "COCKPIT DE CONTROLE — SILVA HOLDING"
-CONFIG_PATH = "config_bom.json"
+st.set_page_config(page_title="Cockpit de Controle — Silva Holding", layout="wide")
 
+# ---------------------------
+# Utils
+# ---------------------------
+def _clean_gid(gid_value: str) -> str:
+    """Accepts 'gid=123', '123', or URL fragments and returns only digits string."""
+    if gid_value is None:
+        return ""
+    s = str(gid_value).strip()
+    m = re.search(r"(\d+)", s)
+    return m.group(1) if m else ""
 
-# -----------------------------
-# Utilidades: Config persistente
-# -----------------------------
-def load_config() -> dict:
-    if os.path.exists(CONFIG_PATH):
+def _gsheet_csv_url(spreadsheet_id: str, gid: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
+
+@st.cache_data(show_spinner=False, ttl=60)
+def read_gsheet_csv(spreadsheet_id: str, gid: str) -> pd.DataFrame:
+    gid = _clean_gid(gid)
+    url = _gsheet_csv_url(spreadsheet_id, gid)
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    content = r.content.decode("utf-8", errors="replace")
+    return pd.read_csv(io.StringIO(content))
+
+def load_saved_config() -> dict:
+    if os.path.exists(APP_CONFIG_PATH):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(APP_CONFIG_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
-
 def save_config(cfg: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+    with open(APP_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-
-def normalize_gid(value: str) -> str:
-    """
-    Aceita 'gid=123', '123', '  gid=123  ' etc, e retorna só o número.
-    """
-    if value is None:
-        return ""
-    s = str(value).strip()
-    s = s.replace("GID", "gid").replace("Gid", "gid").strip()
-    if "gid=" in s:
-        s = s.split("gid=")[-1]
-    s = re.sub(r"[^\d]", "", s)
-    return s
-
-
-def sheet_csv_url(spreadsheet_id: str, gid: str) -> str:
-    gid = normalize_gid(gid)
-    spreadsheet_id = str(spreadsheet_id).strip()
-    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
-
-
-@st.cache_data(show_spinner=False)
-def read_google_sheet_csv(spreadsheet_id: str, gid: str) -> pd.DataFrame:
-    url = sheet_csv_url(spreadsheet_id, gid)
-    df = pd.read_csv(url, dtype=str).fillna("")
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
     return df
 
-
-# -----------------------------
-# Utilidades: limpeza e parsing
-# -----------------------------
-def _to_float_safe(x):
-    if x is None:
-        return 0.0
-    s = str(x).strip()
-    if s == "" or s.lower() == "nan":
-        return 0.0
-    s = s.replace(".", "").replace(",", ".")  # BR -> float
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
-
-
-def _to_int_safe(x):
-    return int(round(_to_float_safe(x), 0))
-
-
-def split_csv_like(cell: str):
-    if cell is None:
-        return []
-    s = str(cell).strip()
-    if s == "" or s.lower() == "nan":
-        return []
-    parts = [p.strip() for p in s.split(",")]
-    return [p for p in parts if p != ""]
-
-
-def infer_vendas_columns(df: pd.DataFrame):
+def guess_sales_columns(df: pd.DataFrame):
     """
-    Detecta coluna de código e quantidade em CSV/XLSX de vendas.
-    Aceita variações comuns: codigo, Código, SKU, Produto, etc.
+    Detect columns for:
+      - codigo (SKU / Código / codigo)
+      - quantidade (quantidade / qtde / qtd / quantidade vendida / etc)
     """
     cols = list(df.columns)
-    lower_map = {c: str(c).strip().lower() for c in cols}
 
-    code_candidates = []
-    qty_candidates = []
+    code_candidates = [
+        "codigo", "código", "sku", "referencia", "referência",
+        "produto", "produto_codigo", "cod", "cód", "codigo_produto"
+    ]
+    qty_candidates = [
+        "quantidade", "qtde", "qtd", "qt", "qde", "qtd_vendida",
+        "quantidade_vendida", "quantidade total", "quantidade_total"
+    ]
 
-    for c in cols:
-        lc = lower_map[c]
-        if any(k in lc for k in ["codigo", "código", "sku", "cód", "ref", "refer"]):
-            code_candidates.append(c)
-        if any(k in lc for k in ["quantidade", "qtde", "qtd", "quant", "qte"]):
-            qty_candidates.append(c)
-
-    # fallback: primeira coluna como código, segunda como qty
-    code_col = code_candidates[0] if code_candidates else (cols[0] if cols else None)
+    code_col = None
     qty_col = None
 
-    # tenta achar qty col diferente da code
-    for cand in qty_candidates:
-        if cand != code_col:
-            qty_col = cand
+    # direct match
+    for c in cols:
+        if c in code_candidates:
+            code_col = c
+            break
+    for c in cols:
+        if c in qty_candidates:
+            qty_col = c
             break
 
-    if qty_col is None and len(cols) >= 2:
-        qty_col = cols[1]
+    # fuzzy contains
+    if code_col is None:
+        for c in cols:
+            if "codigo" in c or "código" in c or "sku" in c:
+                code_col = c
+                break
+    if qty_col is None:
+        for c in cols:
+            if "quant" in c or "qtde" in c or "qtd" in c:
+                qty_col = c
+                break
 
     return code_col, qty_col
 
-
-def load_vendas_file(uploaded) -> pd.DataFrame:
-    """
-    Lê CSV/XLSX com vendas e normaliza para colunas:
-      - codigo
-      - quantidade
-    """
-    name = uploaded.name.lower()
-
+def read_sales_file(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
     if name.endswith(".csv"):
-        raw = pd.read_csv(uploaded, dtype=str).fillna("")
+        df = pd.read_csv(uploaded_file)
     elif name.endswith(".xlsx") or name.endswith(".xls"):
-        raw = pd.read_excel(uploaded, dtype=str).fillna("")
+        df = pd.read_excel(uploaded_file)
     else:
-        raise ValueError("Formato de arquivo não suportado. Use CSV ou XLSX.")
-
-    if raw.empty:
-        return pd.DataFrame(columns=["codigo", "quantidade"])
-
-    code_col, qty_col = infer_vendas_columns(raw)
+        raise ValueError("Arquivo de vendas precisa ser CSV ou XLSX.")
+    df = normalize_cols(df)
+    code_col, qty_col = guess_sales_columns(df)
 
     if code_col is None or qty_col is None:
-        raise KeyError("Não consegui detectar as colunas de código e quantidade no arquivo de vendas.")
+        raise KeyError(
+            f"Não encontrei colunas de vendas. Achei colunas: {list(df.columns)}. "
+            "Precisa ter algo como 'codigo/sku' e 'quantidade/qtde'."
+        )
 
-    vendas = raw[[code_col, qty_col]].copy()
-    vendas.columns = ["codigo", "quantidade"]
+    out = df[[code_col, qty_col]].copy()
+    out.columns = ["codigo", "quantidade"]
 
-    vendas["codigo"] = vendas["codigo"].astype(str).str.strip()
-    vendas["quantidade"] = vendas["quantidade"].apply(_to_float_safe)
+    # clean
+    out["codigo"] = out["codigo"].astype(str).str.strip()
+    out["quantidade"] = pd.to_numeric(out["quantidade"], errors="coerce").fillna(0)
 
-    vendas = vendas[vendas["codigo"] != ""]
-    vendas = vendas.groupby("codigo", as_index=False)["quantidade"].sum()
-    vendas["quantidade"] = vendas["quantidade"].apply(lambda x: int(round(x, 0)))
+    out = out[out["codigo"] != ""]
+    out = out.groupby("codigo", as_index=False)["quantidade"].sum()
+    out = out[out["quantidade"] > 0]
+    return out
 
-    return vendas
+def split_list_field(value) -> list:
+    """Splits comma-separated lists, tolerates NaN."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return []
+    s = str(value).strip()
+    if s == "" or s.lower() == "nan":
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
 
+def split_qty_field(value) -> list:
+    """Splits comma-separated qty lists into floats/ints."""
+    items = split_list_field(value)
+    out = []
+    for it in items:
+        try:
+            out.append(float(str(it).replace(",", ".")))
+        except Exception:
+            out.append(0.0)
+    return out
 
-# -----------------------------
-# Leitura e normalização do estoque + BOMs
-# -----------------------------
-def normalize_template_estoque(df: pd.DataFrame) -> pd.DataFrame:
-    # Esperado: colunas pelo menos "codigo" e "estoque_atual"
-    cols = [c.strip().lower() for c in df.columns]
-    colmap = {df.columns[i]: cols[i] for i in range(len(df.columns))}
-    df2 = df.rename(columns=colmap).copy()
+def safe_int(x) -> int:
+    try:
+        return int(float(x))
+    except Exception:
+        return 0
 
-    # tenta localizar colunas
-    possible_code = [c for c in df2.columns if "codigo" in c or "sku" in c]
-    possible_stock = [c for c in df2.columns if "estoque_atual" in c or ("estoque" in c and "atual" in c) or c == "estoque"]
-
-    if not possible_code:
-        raise KeyError("template_estoque: não achei coluna de código (ex: 'codigo').")
-    if not possible_stock:
-        raise KeyError("template_estoque: não achei coluna de estoque (ex: 'estoque_atual').")
-
-    df2 = df2[[possible_code[0], possible_stock[0]]].copy()
-    df2.columns = ["codigo", "estoque_atual"]
-
-    df2["codigo"] = df2["codigo"].astype(str).str.strip()
-    df2["estoque_atual"] = df2["estoque_atual"].apply(_to_float_safe)
-
-    df2 = df2[df2["codigo"] != ""]
-    df2 = df2.groupby("codigo", as_index=False)["estoque_atual"].sum()
-
-    return df2
-
-
-def normalize_bom_produto_simples(df: pd.DataFrame) -> pd.DataFrame:
-    # Mantém nomes exatamente como você definiu
-    needed = [
-        "codigo_final",
-        "semi_codigo", "semi_qtd",
-        "gola_codigo", "gola_qtd",
-        "bordado_codigo", "bordado_qtd",
-        "extras_codigos", "extras_qtds",
-    ]
-    got = [c.strip() for c in df.columns]
-    if not set(needed).issubset(set(got)):
-        raise KeyError(f"bom_produto_simples: colunas esperadas: {needed}")
-
-    df2 = df[needed].copy().fillna("")
-    df2["codigo_final"] = df2["codigo_final"].astype(str).str.strip()
-
-    # quantidades como string -> float
-    for col in ["semi_qtd", "bordado_qtd"]:
-        df2[col] = df2[col].apply(_to_float_safe)
-
-    # gola_qtd e extras_qtds são listas "1,2" etc (string)
-    df2["gola_codigo"] = df2["gola_codigo"].astype(str).str.strip()
-    df2["gola_qtd"] = df2["gola_qtd"].astype(str).str.strip()
-
-    df2["extras_codigos"] = df2["extras_codigos"].astype(str).str.strip()
-    df2["extras_qtds"] = df2["extras_qtds"].astype(str).str.strip()
-
-    return df2[df2["codigo_final"] != ""]
-
-
-def normalize_bom_kits_conjuntos(df: pd.DataFrame) -> pd.DataFrame:
-    needed = ["codigo_final", "componentes_codigos", "componentes_qtds"]
-    got = [c.strip() for c in df.columns]
-    if not set(needed).issubset(set(got)):
-        raise KeyError(f"bom_kits_conjuntos: colunas esperadas: {needed}")
-
-    df2 = df[needed].copy().fillna("")
-    df2["codigo_final"] = df2["codigo_final"].astype(str).str.strip()
-    df2["componentes_codigos"] = df2["componentes_codigos"].astype(str).str.strip()
-    df2["componentes_qtds"] = df2["componentes_qtds"].astype(str).str.strip()
-
-    return df2[df2["codigo_final"] != ""]
-
-
-# -----------------------------
-# Explosão BOM com sua regra suprema
-# -----------------------------
+# ---------------------------
+# BOM Engine
+# ---------------------------
 class BomEngine:
     def __init__(self, estoque_df, bom_simples_df, bom_kits_df):
-        self.estoque = {r["codigo"]: float(r["estoque_atual"]) for _, r in estoque_df.iterrows()}
-        self.bom_simples = {r["codigo_final"]: r for _, r in bom_simples_df.iterrows()}
-        self.bom_kits = {r["codigo_final"]: r for _, r in bom_kits_df.iterrows()}
+        self.estoque = estoque_df.copy()
+        self.bom_simples = bom_simples_df.copy()
+        self.bom_kits = bom_kits_df.copy()
 
-        self.insumos_need = {}   # codigo -> {"categoria": "...", "necessario": float}
-        self.acao_fabricar = {}  # codigo -> qtd_faltante (float)
-        self.faltantes_produtos = {}  # codigo_final -> faltante (int)
+        self.estoque = normalize_cols(self.estoque)
+        self.bom_simples = normalize_cols(self.bom_simples)
+        self.bom_kits = normalize_cols(self.bom_kits)
+
+        # expected columns
+        # estoque: codigo, estoque_atual
+        if "codigo" not in self.estoque.columns:
+            raise KeyError("template_estoque precisa ter coluna 'codigo'.")
+        if "estoque_atual" not in self.estoque.columns:
+            raise KeyError("template_estoque precisa ter coluna 'estoque_atual'.")
+
+        self.estoque["codigo"] = self.estoque["codigo"].astype(str).str.strip()
+        self.estoque["estoque_atual"] = pd.to_numeric(self.estoque["estoque_atual"], errors="coerce").fillna(0)
+
+        # Map for fast lookup
+        self.stock_map = dict(zip(self.estoque["codigo"], self.estoque["estoque_atual"]))
+
+        # Index BOMs
+        if "codigo_final" not in self.bom_simples.columns:
+            raise KeyError("bom_produto_simples precisa ter coluna 'codigo_final'.")
+        if "codigo_final" not in self.bom_kits.columns:
+            raise KeyError("bom_kits_conjuntos precisa ter coluna 'codigo_final'.")
+
+        self.bom_simples["codigo_final"] = self.bom_simples["codigo_final"].astype(str).str.strip()
+        self.bom_kits["codigo_final"] = self.bom_kits["codigo_final"].astype(str).str.strip()
+
+        self.simples_map = {row["codigo_final"]: row for _, row in self.bom_simples.iterrows()}
+        self.kits_map = {row["codigo_final"]: row for _, row in self.bom_kits.iterrows()}
+
+        # outputs
+        self.insumos_rows = []
+        self.acao_rows = []
+
+        # to avoid infinite loops
+        self.visiting = set()
 
     def stock(self, codigo: str) -> float:
-        # Estoque negativo é tratado como 0 para decisão de explosão (não atende demanda)
-        val = self.estoque.get(codigo, 0.0)
-        return max(0.0, float(val))
+        return float(self.stock_map.get(str(codigo).strip(), 0))
 
-    def add_insumo(self, codigo: str, categoria: str, qtd: float):
-        if not codigo or str(codigo).strip() == "":
-            return
-        codigo = str(codigo).strip()
-        if codigo not in self.insumos_need:
-            self.insumos_need[codigo] = {"categoria": categoria, "necessario": 0.0}
-        self.insumos_need[codigo]["necessario"] += float(qtd)
+    def shortfall(self, codigo: str, demand: float) -> float:
+        """Explode only the missing quantity (demand - available), never negative."""
+        available = self.stock(codigo)
+        # if negative stock, treat as 0 available (so shortfall is full demand)
+        available = max(0.0, available)
+        return max(0.0, float(demand) - available)
 
-    def explode_demanda(self, codigo_final: str, demanda_qty: float):
+    def add_insumo(self, parent, insumo_tipo, insumo_codigo, req_qtd, stock_qtd):
+        faltante = max(0.0, req_qtd - max(0.0, stock_qtd))
+        status = "OK" if faltante <= 0 else "FALTANDO"
+        obs = "" if faltante <= 0 else "PLATELEIRA ESTOQUE"
+        self.insumos_rows.append({
+            "codigo_pai": parent,
+            "tipo": insumo_tipo,
+            "codigo_insumo": insumo_codigo,
+            "qtd_necessaria": req_qtd,
+            "estoque_atual": stock_qtd,
+            "faltante": faltante,
+            "status": status,
+            "observacao": obs,
+        })
+        if faltante > 0:
+            self.acao_rows.append({
+                "acao": "FABRICAR",
+                "tipo": insumo_tipo,
+                "codigo": insumo_codigo,
+                "quantidade": faltante,
+                "observacao": "PLATELEIRA ESTOQUE",
+                "origem": parent
+            })
+
+    def explode(self, codigo_final: str, demand: float, root_parent: str = None):
+        """
+        Explodes demand for codigo_final following rules.
+        root_parent: original sales code for reporting trace.
+        """
         codigo_final = str(codigo_final).strip()
-        if codigo_final == "" or demanda_qty <= 0:
+        if root_parent is None:
+            root_parent = codigo_final
+
+        # Prevent cycles
+        key = (codigo_final, root_parent)
+        if key in self.visiting:
             return
+        self.visiting.add(key)
 
-        disponivel = self.stock(codigo_final)
-        faltante = max(0.0, float(demanda_qty) - float(disponivel))
+        faltante = self.shortfall(codigo_final, demand)
 
+        # Rule: if no shortfall, don't explode
         if faltante <= 0:
-            # Regra suprema: tendo estoque suficiente -> não explode
+            self.visiting.remove(key)
             return
 
-        # registra faltante do produto final (para relatório)
-        self.faltantes_produtos[codigo_final] = self.faltantes_produtos.get(codigo_final, 0.0) + faltante
+        # If it's a KIT/CONJUNTO, explode into components first
+        if codigo_final in self.kits_map:
+            row = self.kits_map[codigo_final]
+            comps = split_list_field(row.get("componentes_codigos"))
+            qtys = split_qty_field(row.get("componentes_qtds"))
 
-        # explode apenas o faltante
-        self._explode_codigo(codigo_final, faltante)
+            # pad qtys
+            if len(qtys) < len(comps):
+                qtys += [1.0] * (len(comps) - len(qtys))
 
-    def _explode_codigo(self, codigo: str, qty_needed: float):
-        """
-        Explode recursivamente:
-        - Se o código existir como kit/conjunto: explode componentes (cada componente passa pela regra de estoque)
-        - Se o código existir como produto simples: explode até insumos (Semi/Gola/Bordado/Extras)
-        - Se não existir em BOM: trata como "insumo puro" e cai para controle de estoque/ação.
-        """
-        codigo = str(codigo).strip()
-        if codigo == "" or qty_needed <= 0:
+            for comp, q in zip(comps, qtys):
+                comp_demand = faltante * float(q if q is not None else 1.0)
+                # each component is treated like a product: if has stock, no further explosion
+                self.explode(comp, comp_demand, root_parent=root_parent)
+
+            self.visiting.remove(key)
             return
 
-        # Antes de explodir qualquer filho: aplica regra no próprio codigo (se for um produto com estoque)
-        # -> aqui, quem chama já passou faltante, então não re-checa.
-
-        if codigo in self.bom_kits:
-            row = self.bom_kits[codigo]
-            comp_codes = split_csv_like(row["componentes_codigos"])
-            comp_qtds = split_csv_like(row["componentes_qtds"])
-
-            if len(comp_codes) != len(comp_qtds):
-                # Se estiver desalinhado, explode o que conseguir
-                min_len = min(len(comp_codes), len(comp_qtds))
-                comp_codes = comp_codes[:min_len]
-                comp_qtds = comp_qtds[:min_len]
-
-            for cc, cq in zip(comp_codes, comp_qtds):
-                cc = str(cc).strip()
-                mult = _to_float_safe(cq)
-                child_need = qty_needed * mult
-
-                # regra suprema nos componentes:
-                disponivel = self.stock(cc)
-                child_falt = max(0.0, child_need - disponivel)
-                if child_falt <= 0:
-                    continue
-
-                # explode componente faltante
-                self._explode_codigo(cc, child_falt)
-
-            return
-
-        if codigo in self.bom_simples:
-            row = self.bom_simples[codigo]
+        # If it's a SIMPLE product, explode to insumos
+        if codigo_final in self.simples_map:
+            row = self.simples_map[codigo_final]
 
             # Semi
-            semi_code = str(row["semi_codigo"]).strip()
-            semi_qtd = _to_float_safe(row["semi_qtd"])
-            if semi_code and semi_qtd > 0:
-                self.add_insumo(semi_code, "SEMI", qty_needed * semi_qtd)
+            semi_cod = row.get("semi_codigo")
+            semi_qtd = row.get("semi_qtd", 1)
+            semi_cod = "" if semi_cod is None else str(semi_cod).strip()
+            semi_qtd = float(semi_qtd) if str(semi_qtd).strip() != "" else 1.0
+
+            if semi_cod:
+                req = faltante * semi_qtd
+                self.add_insumo(root_parent, "SEMI", semi_cod, req, self.stock(semi_cod))
 
             # Golas (lista)
-            gola_codes = split_csv_like(row["gola_codigo"])
-            gola_qtds = split_csv_like(row["gola_qtd"])
-            if len(gola_codes) != len(gola_qtds):
-                min_len = min(len(gola_codes), len(gola_qtds))
-                gola_codes = gola_codes[:min_len]
-                gola_qtds = gola_qtds[:min_len]
-            for gc, gq in zip(gola_codes, gola_qtds):
-                gc = str(gc).strip()
-                mult = _to_float_safe(gq)
-                if gc and mult > 0:
-                    self.add_insumo(gc, "GOLA", qty_needed * mult)
+            golas = split_list_field(row.get("gola_codigo"))
+            gola_qtys = split_qty_field(row.get("gola_qtd"))
+
+            if len(gola_qtys) < len(golas):
+                gola_qtys += [1.0] * (len(golas) - len(gola_qtys))
+
+            for g, q in zip(golas, gola_qtys):
+                if g:
+                    req = faltante * float(q)
+                    self.add_insumo(root_parent, "GOLA", g, req, self.stock(g))
 
             # Bordado
-            bord_code = str(row["bordado_codigo"]).strip()
-            bord_qtd = _to_float_safe(row["bordado_qtd"])
-            if bord_code and bord_code.lower() != "nan" and bord_code != "" and bord_qtd > 0:
-                self.add_insumo(bord_code, "BORDADO", qty_needed * bord_qtd)
+            bcod = row.get("bordado_codigo")
+            bqtd = row.get("bordado_qtd", 0)
+            bcod = "" if bcod is None else str(bcod).strip()
+            bqtd = float(bqtd) if str(bqtd).strip() != "" else 0.0
+            if bcod and bqtd > 0:
+                req = faltante * bqtd
+                self.add_insumo(root_parent, "BORDADO", bcod, req, self.stock(bcod))
 
             # Extras (lista)
-            extra_codes = split_csv_like(row["extras_codigos"])
-            extra_qtds = split_csv_like(row["extras_qtds"])
-            if len(extra_codes) != len(extra_qtds):
-                min_len = min(len(extra_codes), len(extra_qtds))
-                extra_codes = extra_codes[:min_len]
-                extra_qtds = extra_qtds[:min_len]
-            for ec, eq in zip(extra_codes, extra_qtds):
-                ec = str(ec).strip()
-                mult = _to_float_safe(eq)
-                if ec and mult > 0:
-                    self.add_insumo(ec, "EXTRA", qty_needed * mult)
+            extras = split_list_field(row.get("extras_codigos"))
+            extras_qtys = split_qty_field(row.get("extras_qtds"))
+            if len(extras_qtys) < len(extras):
+                extras_qtys += [1.0] * (len(extras) - len(extras_qtys))
 
+            for e, q in zip(extras, extras_qtys):
+                if e:
+                    req = faltante * float(q)
+                    self.add_insumo(root_parent, "EXTRA", e, req, self.stock(e))
+
+            self.visiting.remove(key)
             return
 
-        # Se não está em BOM, assume que é um insumo “puro” (ou item sem cadastro de estrutura)
-        # e vai para controle de estoque
-        self.add_insumo(codigo, "INSUMO", qty_needed)
+        # If no BOM registered for this code -> treat as "missing mapping"
+        self.acao_rows.append({
+            "acao": "CADASTRAR_BOM",
+            "tipo": "PRODUTO",
+            "codigo": codigo_final,
+            "quantidade": faltante,
+            "observacao": "Sem BOM cadastrada",
+            "origem": root_parent
+        })
 
-    def finalize_acoes(self):
-        """
-        Depois de consolidar insumos_need, calcula faltantes vs estoque e gera lista de FABRICAR.
-        """
-        for codigo, info in self.insumos_need.items():
-            necessario = float(info["necessario"])
-            disp = self.stock(codigo)
-            falt = max(0.0, necessario - disp)
-            if falt > 0:
-                self.acao_fabricar[codigo] = self.acao_fabricar.get(codigo, 0.0) + falt
+        self.visiting.remove(key)
 
     def build_reports(self):
-        self.finalize_acoes()
-
-        # 01_FALTANTES_PRODUTOS
-        falt_prod = pd.DataFrame(
-            [{"codigo_final": k, "faltante": float(v)} for k, v in self.faltantes_produtos.items()]
+        insumos = pd.DataFrame(self.insumos_rows) if self.insumos_rows else pd.DataFrame(
+            columns=["codigo_pai","tipo","codigo_insumo","qtd_necessaria","estoque_atual","faltante","status","observacao"]
         )
-        if not falt_prod.empty:
-            falt_prod = falt_prod.sort_values("faltante", ascending=False).reset_index(drop=True)
+        acao = pd.DataFrame(self.acao_rows) if self.acao_rows else pd.DataFrame(
+            columns=["acao","tipo","codigo","quantidade","observacao","origem"]
+        )
 
-        # 03_INSUMOS
-        ins_rows = []
-        for codigo, info in self.insumos_need.items():
-            necessario = float(info["necessario"])
-            estoque_atual = self.stock(codigo)
-            faltante = max(0.0, necessario - estoque_atual)
-
-            if faltante <= 0:
-                status = "OK"
-            elif estoque_atual <= 0:
-                status = "FALTA"
-            else:
-                status = "PARCIAL"
-
-            ins_rows.append(
-                {
-                    "codigo": codigo,
-                    "categoria": info["categoria"],
-                    "necessario": round(necessario, 4),
-                    "estoque_atual": round(estoque_atual, 4),
-                    "faltante": round(faltante, 4),
-                    "status": status,
-                }
-            )
-        insumos = pd.DataFrame(ins_rows)
+        # Aggregate duplicates
         if not insumos.empty:
-            insumos = insumos.sort_values(["status", "faltante"], ascending=[True, False]).reset_index(drop=True)
+            insumos["qtd_necessaria"] = pd.to_numeric(insumos["qtd_necessaria"], errors="coerce").fillna(0)
+            insumos["estoque_atual"] = pd.to_numeric(insumos["estoque_atual"], errors="coerce").fillna(0)
+            insumos["faltante"] = pd.to_numeric(insumos["faltante"], errors="coerce").fillna(0)
 
-        # 04_LISTA_ACAO
-        ac_rows = []
-        for codigo, falt in self.acao_fabricar.items():
-            ac_rows.append(
-                {
-                    "acao": "FABRICAR",
-                    "codigo": codigo,
-                    "qtd_faltante": round(float(falt), 4),
-                    "observacao": "PLATELEIRA ESTOQUE",
-                }
+            insumos = (insumos
+                .groupby(["codigo_pai","tipo","codigo_insumo"], as_index=False)
+                .agg({
+                    "qtd_necessaria":"sum",
+                    "estoque_atual":"first",
+                    "faltante":"sum",
+                    "observacao":"first"
+                })
             )
-        acoes = pd.DataFrame(ac_rows)
-        if not acoes.empty:
-            acoes = acoes.sort_values("qtd_faltante", ascending=False).reset_index(drop=True)
+            insumos["status"] = np.where(insumos["faltante"] > 0, "FALTANDO", "OK")
 
-        return falt_prod, insumos, acoes
+            # Order: faltantes first
+            insumos = insumos.sort_values(["status","faltante"], ascending=[True, False])
+            # Put FALTANDO on top
+            insumos["status_order"] = np.where(insumos["status"]=="FALTANDO", 0, 1)
+            insumos = insumos.sort_values(["status_order","faltante"], ascending=[True, False]).drop(columns=["status_order"])
+
+        if not acao.empty:
+            acao["quantidade"] = pd.to_numeric(acao["quantidade"], errors="coerce").fillna(0)
+            acao = (acao
+                .groupby(["acao","tipo","codigo","observacao"], as_index=False)
+                .agg({
+                    "quantidade":"sum",
+                    "origem":lambda x: ", ".join(sorted(set([str(v) for v in x if str(v).strip() != ""])))[:500]
+                })
+            )
+            acao = acao.sort_values(["acao","quantidade"], ascending=[True, False])
+
+        return insumos, acao
 
 
-def build_excel_bytes(falt_prod, insumos, acoes) -> bytes:
-    output = BytesIO()
+def to_excel_bytes(insumos_df: pd.DataFrame, acao_df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if falt_prod is None or falt_prod.empty:
-            pd.DataFrame(columns=["codigo_final", "faltante"]).to_excel(writer, sheet_name="01_FALTANTES_PRODUTOS", index=False)
-        else:
-            falt_prod.to_excel(writer, sheet_name="01_FALTANTES_PRODUTOS", index=False)
-
-        if insumos is None or insumos.empty:
-            pd.DataFrame(columns=["codigo", "categoria", "necessario", "estoque_atual", "faltante", "status"]).to_excel(writer, sheet_name="03_INSUMOS", index=False)
-        else:
-            insumos.to_excel(writer, sheet_name="03_INSUMOS", index=False)
-
-        if acoes is None or acoes.empty:
-            pd.DataFrame(columns=["acao", "codigo", "qtd_faltante", "observacao"]).to_excel(writer, sheet_name="04_LISTA_ACAO", index=False)
-        else:
-            acoes.to_excel(writer, sheet_name="04_LISTA_ACAO", index=False)
-
-    output.seek(0)
-    return output.read()
+        insumos_df.to_excel(writer, index=False, sheet_name="03_INSUMOS")
+        acao_df.to_excel(writer, index=False, sheet_name="04_LISTA_ACAO")
+    return output.getvalue()
 
 
-# -----------------------------
+# ---------------------------
 # UI
-# -----------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+# ---------------------------
+saved = load_saved_config()
 
-st.markdown(
-    f"""
-    <div style="background:linear-gradient(180deg,#244c87,#1c3f73);padding:22px;border-radius:16px;color:white;">
-      <div style="font-size:34px;font-weight:800;text-align:center;">{APP_TITLE}</div>
-      <div style="text-align:center;opacity:0.85;margin-top:6px;">"Se parar para sentir o perfume das rosas, vem um caminhão e te atropela."</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+if "cfg" not in st.session_state:
+    st.session_state.cfg = {
+        "spreadsheet_id": saved.get("spreadsheet_id", ""),
+        "gid_template_estoque": saved.get("gid_template_estoque", ""),
+        "gid_bom_produto_simples": saved.get("gid_bom_produto_simples", ""),
+        "gid_bom_kits_conjuntos": saved.get("gid_bom_kits_conjuntos", ""),
+    }
 
-tabs = st.tabs(["📦 Explosão BOM (Produção)", "⚙️ Configuração / Diagnóstico"])
+tab1, tab2 = st.tabs(["📦 Explosão BOM (Produção)", "⚙️ Configuração / Diagnóstico"])
 
-# -----------------------------
-# TAB 2 - Config
-# -----------------------------
-with tabs[1]:
-    st.subheader("Configuração de Fonte de Dados")
+with tab2:
+    st.markdown("### Configuração de Fonte de Dados")
+    st.caption("Cole o Spreadsheet ID e os GIDs. Aceita 'gid=123' ou só '123'. Clique em **Salvar** e você não preenche mais.")
 
-    cfg = load_config()
-    if "source_type" not in cfg:
-        cfg["source_type"] = "gsheets"
+    c1, c2, c3, c4 = st.columns([2,1,1,1])
+    with c1:
+        spreadsheet_id = st.text_input("Spreadsheet ID (entre /d/ e /edit)", value=st.session_state.cfg["spreadsheet_id"])
+    with c2:
+        gid_template = st.text_input("GID da aba template_estoque", value=st.session_state.cfg["gid_template_estoque"])
+    with c3:
+        gid_simples = st.text_input("GID da aba bom_produto_simples", value=st.session_state.cfg["gid_bom_produto_simples"])
+    with c4:
+        gid_kits = st.text_input("GID da aba bom_kits_conjuntos", value=st.session_state.cfg["gid_bom_kits_conjuntos"])
 
-    source_type = st.radio(
-        "Como ler a planilha template_estoque?",
-        ["Google Sheets (recomendado)", "Upload de Excel (template_estoque + BOMs)"],
-        index=0 if cfg["source_type"] == "gsheets" else 1,
-        horizontal=True,
-    )
-    cfg["source_type"] = "gsheets" if source_type.startswith("Google") else "excel"
+    colA, colB = st.columns([1,3])
+    with colA:
+        if st.button("💾 Salvar configuração"):
+            st.session_state.cfg.update({
+                "spreadsheet_id": str(spreadsheet_id).strip(),
+                "gid_template_estoque": _clean_gid(gid_template),
+                "gid_bom_produto_simples": _clean_gid(gid_simples),
+                "gid_bom_kits_conjuntos": _clean_gid(gid_kits),
+            })
+            save_config(st.session_state.cfg)
+            st.success("Config salva. Agora você não precisa preencher toda hora (enquanto o app estiver rodando).")
 
-    st.divider()
+    st.markdown("---")
+    st.markdown("### Teste rápido de leitura (sem explosão)")
 
-    if cfg["source_type"] == "gsheets":
-        st.caption("Informe o Spreadsheet ID e os GIDs de cada aba. Depois de validar, o app **salva automaticamente** e você não preenche mais.")
-        spreadsheet_id = st.text_input(
-            "Spreadsheet ID (entre /d/ e /edit)",
-            value=cfg.get("spreadsheet_id", ""),
-        )
-        gid_template = st.text_input(
-            "GID da aba template_estoque",
-            value=cfg.get("gid_template_estoque", ""),
-        )
-        gid_simples = st.text_input(
-            "GID da aba bom_produto_simples",
-            value=cfg.get("gid_bom_produto_simples", ""),
-        )
-        gid_kits = st.text_input(
-            "GID da aba bom_kits_conjuntos",
-            value=cfg.get("gid_bom_kits_conjuntos", ""),
-        )
+    if st.button("🔎 Validar leitura agora"):
+        try:
+            sid = str(spreadsheet_id).strip()
+            if not sid:
+                st.error("Preencha o Spreadsheet ID.")
+            else:
+                df_est = read_gsheet_csv(sid, _clean_gid(gid_template))
+                df_s  = read_gsheet_csv(sid, _clean_gid(gid_simples))
+                df_k  = read_gsheet_csv(sid, _clean_gid(gid_kits))
 
-        colA, colB = st.columns([1, 3])
-        with colA:
-            validate = st.button("🔎 Validar leitura agora", use_container_width=True)
+                st.success("Leitura OK ✅")
+                st.write("template_estoque (amostra):", df_est.head(20))
+                st.write("bom_produto_simples (amostra):", df_s.head(20))
+                st.write("bom_kits_conjuntos (amostra):", df_k.head(20))
 
-        if validate:
-            try:
-                df_template = read_google_sheet_csv(spreadsheet_id, gid_template)
-                df_simples = read_google_sheet_csv(spreadsheet_id, gid_simples)
-                df_kits = read_google_sheet_csv(spreadsheet_id, gid_kits)
+        except Exception as e:
+            st.error(f"Erro ao ler/validar: {type(e).__name__}: {e}")
 
-                # Normaliza e testa
-                template_ok = normalize_template_estoque(df_template)
-                simples_ok = normalize_bom_produto_simples(df_simples)
-                kits_ok = normalize_bom_kits_conjuntos(df_kits)
+with tab1:
+    st.markdown("## Explosão BOM (Produção)")
+    st.caption("Suba a planilha de vendas (CSV/XLSX). O app explode apenas o faltante e gera relatório (Insumos + Lista de Ação).")
 
-                # salva config (AQUI está o “NÃO PREENCHER TODA HORA”)
-                cfg["spreadsheet_id"] = spreadsheet_id.strip()
-                cfg["gid_template_estoque"] = normalize_gid(gid_template)
-                cfg["gid_bom_produto_simples"] = normalize_gid(gid_simples)
-                cfg["gid_bom_kits_conjuntos"] = normalize_gid(gid_kits)
-                cfg["last_validated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                save_config(cfg)
-
-                st.success("Leitura OK ✅ Configuração salva automaticamente. Você não precisa preencher de novo.")
-                st.write("template_estoque (amostra):")
-                st.dataframe(template_ok.head(10), use_container_width=True)
-                st.write("bom_produto_simples (amostra):")
-                st.dataframe(simples_ok.head(10), use_container_width=True)
-                st.write("bom_kits_conjuntos (amostra):")
-                st.dataframe(kits_ok.head(10), use_container_width=True)
-
-            except Exception as e:
-                st.error(f"Erro ao ler/validar: {type(e).__name__}: {e}")
-                st.info("Dica: no link do Google Sheets aparece `gid=...` para cada aba. Cole só o número ou `gid=123`.")
-
-    else:
-        st.warning("Modo Excel ainda não implementado neste build (você está usando Google Sheets).")
-
-    st.divider()
-    st.caption("Config atual carregada do arquivo:")
-    st.code(json.dumps(load_config(), ensure_ascii=False, indent=2), language="json")
-
-
-# -----------------------------
-# TAB 1 - Explosão
-# -----------------------------
-with tabs[0]:
-    st.subheader("Explosão BOM (Produção)")
-
-    cfg = load_config()
-    if not cfg or cfg.get("source_type") != "gsheets":
-        st.warning("Configure a fonte de dados em **Configuração / Diagnóstico** e valide a leitura.")
+    cfg = st.session_state.cfg
+    if not cfg.get("spreadsheet_id") or not cfg.get("gid_template_estoque"):
+        st.warning("Vá em **Configuração / Diagnóstico** e salve Spreadsheet ID + GIDs primeiro.")
         st.stop()
 
-    st.info("Regra suprema: tem estoque do código pai suficiente → não explode. Se faltar, explode **só o faltante** até insumos.")
+    uploaded = st.file_uploader("Upload vendas (CSV/XLSX com colunas codigo/quantidade — Bling também serve)", type=["csv","xlsx","xls"])
 
-    up = st.file_uploader("Upload vendas (CSV/XLSX com colunas codigo / quantidade)", type=["csv", "xlsx", "xls"])
-    if up is None:
-        st.stop()
+    if uploaded:
+        try:
+            vendas = read_sales_file(uploaded)
+            st.write("✅ Vendas lidas (amostra):", vendas.head(30))
 
-    try:
-        vendas = load_vendas_file(up)
-    except Exception as e:
-        st.error(f"Falha ao ler arquivo de vendas: {type(e).__name__}: {e}")
-        st.stop()
+            sid = cfg["spreadsheet_id"]
+            df_est = read_gsheet_csv(sid, cfg["gid_template_estoque"])
+            df_s   = read_gsheet_csv(sid, cfg["gid_bom_produto_simples"])
+            df_k   = read_gsheet_csv(sid, cfg["gid_bom_kits_conjuntos"])
 
-    with st.spinner("Lendo planilhas do Google Sheets..."):
-        df_template = read_google_sheet_csv(cfg["spreadsheet_id"], cfg["gid_template_estoque"])
-        df_simples = read_google_sheet_csv(cfg["spreadsheet_id"], cfg["gid_bom_produto_simples"])
-        df_kits = read_google_sheet_csv(cfg["spreadsheet_id"], cfg["gid_bom_kits_conjuntos"])
+            engine = BomEngine(df_est, df_s, df_k)
 
-        estoque_df = normalize_template_estoque(df_template)
-        bom_simples_df = normalize_bom_produto_simples(df_simples)
-        bom_kits_df = normalize_bom_kits_conjuntos(df_kits)
+            if st.button("🚀 Gerar relatório de explosão"):
+                with st.spinner("Explodindo BOM..."):
+                    for _, r in vendas.iterrows():
+                        engine.explode(r["codigo"], float(r["quantidade"]), root_parent=r["codigo"])
 
-    st.write("Vendas (consolidado):")
-    st.dataframe(vendas, use_container_width=True)
+                    insumos_df, acao_df = engine.build_reports()
 
-    if st.button("🚀 Explodir BOM e gerar relatório", use_container_width=True):
-        engine = BomEngine(estoque_df, bom_simples_df, bom_kits_df)
+                st.success("Relatório gerado ✅")
 
-        for _, r in vendas.iterrows():
-            engine.explode_demanda(r["codigo"], float(r["quantidade"]))
+                st.markdown("### 03_INSUMOS")
+                st.dataframe(insumos_df, use_container_width=True, height=380)
 
-        falt_prod, insumos, acoes = engine.build_reports()
+                st.markdown("### 04_LISTA_ACAO")
+                st.dataframe(acao_df, use_container_width=True, height=320)
 
-        st.subheader("01_FALTANTES_PRODUTOS")
-        st.dataframe(falt_prod if falt_prod is not None else pd.DataFrame(), use_container_width=True)
+                xbytes = to_excel_bytes(insumos_df, acao_df)
+                fname = f"relatorio_bom_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                st.download_button("⬇️ Baixar Excel (03_INSUMOS + 04_LISTA_ACAO)", data=xbytes, file_name=fname)
 
-        st.subheader("03_INSUMOS")
-        st.dataframe(insumos if insumos is not None else pd.DataFrame(), use_container_width=True)
-
-        st.subheader("04_LISTA_ACAO")
-        st.dataframe(acoes if acoes is not None else pd.DataFrame(), use_container_width=True)
-
-        xbytes = build_excel_bytes(falt_prod, insumos, acoes)
-        fname = f"relatorio_bom_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-
-        st.download_button(
-            "📥 Baixar Relatório Excel",
-            data=xbytes,
-            file_name=fname,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}")
+            st.info("Dica: Se for Bling, confirme se existe uma coluna parecida com 'Código/SKU' e outra com 'Quantidade/Qtde'.")
