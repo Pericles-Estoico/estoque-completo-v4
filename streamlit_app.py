@@ -1,541 +1,531 @@
+# streamlit_app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
-import re
-import unicodedata
+import requests
+from io import StringIO
 from datetime import datetime
-from io import BytesIO
+import plotly.express as px
+import math
+import unicodedata
 
-st.set_page_config(page_title="Cockpit — Explosão BOM (Produção)", layout="wide")
+# ======================
+# CONFIG
+# ======================
+st.set_page_config(
+    page_title="Estoque Cockpit - Silva Holding",
+    page_icon="🧭",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# =========================
-# Helpers
-# =========================
-def strip_accents(s: str) -> str:
+# ====== SEU ID (fixo) ======
+# use só o ID, não a URL inteira
+SPREADSHEET_ID = "1PpiMQingHf4llA03BiPIuPJPIZqul4grRU_emWDEK1o"
+
+# ====== GIDs (fixos) ======
+# Coloque os GIDs corretos das abas:
+GID_TEMPLATE   = "603934707"   # template_estoque
+GID_BOM_SIMPLES = "0"          # bom_produto_simples  (troque)
+GID_BOM_KITS    = "0"          # bom_kits_conjuntos   (troque)
+
+# Export do template_estoque (CSV)
+SHEETS_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv&gid={GID_TEMPLATE}"
+
+# Webhook Apps Script (mesmo que você já usa)
+WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxTX9uUWnByw6sk6MtuJ5FbjV7zeBKYEoUPPlUlUDS738QqocfCd_NAlh9Eh25XhQywTw/exec"
+
+# ======================
+# HELPERS
+# ======================
+def safe_int(x, default=0):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, float) and math.isnan(x):
+            return default
+        if isinstance(x, str) and x.strip().lower() in {"", "nan", "none", "null", "n/a"}:
+            return default
+        return int(float(str(x).replace(",", ".")))
+    except Exception:
+        return default
+
+def parse_int_list(value):
+    if value is None:
+        return []
+    if isinstance(value, float) and math.isnan(value):
+        return []
+    parts = [p.strip() for p in str(value).split(",")]
+    out = []
+    for p in parts:
+        if not p:
+            continue
+        v = safe_int(p, None)
+        if v is not None:
+            out.append(v)
+    return out
+
+def normalize_key(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
-    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+    s = unicodedata.normalize('NFKD', s)
+    s = ''.join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.replace('ß', 'ss')
+    s = ''.join(ch for ch in s if ch.isalnum() or ch == '-')
+    return s.upper().strip()
 
-def norm_col(c: str) -> str:
-    c = strip_accents(c).lower().strip()
-    c = re.sub(r"\s+", "_", c)
-    c = re.sub(r"[^a-z0-9_]", "", c)
-    return c
-
-def parse_gid(raw: str) -> str:
-    if raw is None:
-        return ""
-    raw = str(raw).strip()
-    raw = raw.replace("gid=", "").strip()
-    raw = re.sub(r"[^\d]", "", raw)
-    return raw
-
-def safe_str(x):
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-def split_csv_like(s: str):
-    s = safe_str(s)
-    if not s:
-        return []
-    return [i.strip() for i in s.split(",") if i.strip()]
-
-def split_nums_like(s: str):
-    s = safe_str(s)
-    if not s:
-        return []
-    out = []
-    for part in s.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            out.append(float(part.replace(",", ".")))
-        except:
-            # se vier lixo, vira 0
-            out.append(0.0)
-    return out
-
-def to_int_safe(x):
+# ======================
+# APPS SCRIPT CALLS
+# ======================
+def movimentar_estoque(codigo, quantidade, tipo, colaborador, test_mode=False):
+    if test_mode:
+        return {'success': True, 'message': 'Simulado', 'novo_estoque': 'SIMULAÇÃO'}
     try:
-        return int(round(float(x)))
-    except:
-        return 0
-
-def bytes_xlsx(sheets: dict) -> bytes:
-    bio = BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            df.to_excel(writer, sheet_name=name, index=False)
-    return bio.getvalue()
-
-# =========================
-# Persistência por URL (não pedir toda hora)
-# =========================
-query = st.query_params
-
-def get_q(name, default=""):
-    v = query.get(name)
-    if v is None:
-        return default
-    if isinstance(v, list):
-        return v[0] if v else default
-    return v
-
-# Defaults (puxa da URL, se existir)
-DEFAULT_SPREADSHEET_ID = get_q("sid", "")
-DEFAULT_GID_TEMPLATE = get_q("gid_template", "")
-DEFAULT_GID_BOM_SIMPLES = get_q("gid_simples", "")
-DEFAULT_GID_BOM_KITS = get_q("gid_kits", "")
-
-# =========================
-# UI - navegação
-# =========================
-tab1, tab2 = st.tabs(["📦 Explosão BOM (Produção)", "⚙️ Configuração / Diagnóstico"])
-
-with tab2:
-    st.subheader("Configuração de Fonte de Dados")
-
-    fonte = st.radio("Como ler a planilha?", ["Google Sheets (recomendado)", "Upload de Excel (template_estoque + BOMs)"], horizontal=True)
-
-    cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
-    with cfg_col1:
-        spreadsheet_id = st.text_input("Spreadsheet ID (entre /d/ e /edit)", value=DEFAULT_SPREADSHEET_ID, placeholder="Ex: 1PpiMQingHf4llA03BiPIuPJPIZqul4grRU_emWDEK1o")
-        gid_template = st.text_input("GID da aba template_estoque", value=DEFAULT_GID_TEMPLATE, placeholder="Ex: 1456159896")
-    with cfg_col2:
-        gid_simples = st.text_input("GID da aba bom_produto_simples", value=DEFAULT_GID_BOM_SIMPLES, placeholder="Ex: 140150541")
-    with cfg_col3:
-        gid_kits = st.text_input("GID da aba bom_kits_conjuntos", value=DEFAULT_GID_BOM_KITS, placeholder="Ex: 1285786936")
-
-    # limpa gid=
-    gid_template = parse_gid(gid_template)
-    gid_simples = parse_gid(gid_simples)
-    gid_kits = parse_gid(gid_kits)
-
-    # botão salvar (joga pra URL)
-    if st.button("💾 Salvar configuração (não pedir mais)", use_container_width=True):
-        st.query_params["sid"] = spreadsheet_id
-        st.query_params["gid_template"] = gid_template
-        st.query_params["gid_simples"] = gid_simples
-        st.query_params["gid_kits"] = gid_kits
-        st.success("Configuração salva. Agora ela fica gravada na URL do seu navegador.")
-
-    st.markdown("---")
-    st.subheader("Como achar o Spreadsheet ID e o GID")
-
-    st.markdown(
-        """
-**Spreadsheet ID:** é o trecho do link entre `/d/` e `/edit`  
-Exemplo:  
-`https://docs.google.com/spreadsheets/d/SEU_ID_AQUI/edit?gid=...`
-
-**GID:** é o número que aparece no final do link quando você clica na aba  
-Exemplo:  
-`.../edit?gid=1456159896` → o GID é `1456159896` (sem escrever `gid=` no campo, mas se colar com `gid=` eu limpo automaticamente).
-"""
-    )
-
-    st.markdown("---")
-    st.subheader("Teste rápido de leitura (sem explosão)")
-
-    @st.cache_data(show_spinner=False, ttl=300)
-    def read_google_sheet(spreadsheet_id: str, gid: str) -> pd.DataFrame:
-        # leitura por CSV export público (funciona se a planilha estiver acessível)
-        # se estiver privada, vai dar erro 400/403
-        url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
-        return pd.read_csv(url)
-
-    def normalize_df_columns(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df.columns = [norm_col(c) for c in df.columns]
-        return df
-
-    if st.button("🔎 Validar leitura agora"):
-        try:
-            if not spreadsheet_id or not gid_template or not gid_simples or not gid_kits:
-                st.error("Preencha Spreadsheet ID e os 3 GIDs.")
-            else:
-                df_t = read_google_sheet(spreadsheet_id, gid_template)
-                df_s = read_google_sheet(spreadsheet_id, gid_simples)
-                df_k = read_google_sheet(spreadsheet_id, gid_kits)
-
-                df_t = normalize_df_columns(df_t)
-                df_s = normalize_df_columns(df_s)
-                df_k = normalize_df_columns(df_k)
-
-                st.success("Leitura OK ✅")
-
-                st.write("template_estoque (amostra):")
-                st.dataframe(df_t.head(10), use_container_width=True)
-
-                st.write("bom_produto_simples (amostra):")
-                st.dataframe(df_s.head(10), use_container_width=True)
-
-                st.write("bom_kits_conjuntos (amostra):")
-                st.dataframe(df_k.head(10), use_container_width=True)
-
-        except Exception as e:
-            st.error(f"Erro ao ler/validar: {e}")
-            st.info("Se der HTTP 400/403: a planilha pode não estar acessível/publicada para leitura por link. Ajuste as permissões.")
-
-# =========================
-# Motor BOM
-# =========================
-def detect_sales_columns(df: pd.DataFrame):
-    dfc = df.copy()
-    dfc.columns = [norm_col(c) for c in dfc.columns]
-
-    # possíveis nomes
-    code_candidates = ["codigo", "cdigo", "sku", "produto", "codprod", "codigo_produto"]
-    qty_candidates = ["quantidade", "qtde", "qtd", "qty", "quant", "qte"]
-
-    code_col = None
-    qty_col = None
-
-    for c in dfc.columns:
-        if c in code_candidates or "codigo" in c or "sku" in c:
-            code_col = c
-            break
-
-    for c in dfc.columns:
-        if c in qty_candidates or "quant" in c or "qtd" in c:
-            qty_col = c
-            break
-
-    return dfc, code_col, qty_col
-
-def explode_need_for_product(
-    codigo_final: str,
-    need_qty: int,
-    estoque_map: dict,
-    bom_simples_map: dict,
-    bom_kits_map: dict,
-    rows_insumos: list,
-    rows_acao: list,
-    visited=None,
-):
-    """
-    Regra suprema:
-    - Se estoque do codigo_final >= need_qty => não explode
-    - Se falta => explode somente faltante
-    - Explode até insumos
-    - Se faltar insumo => FABRICAR
-    - Se faltar BOM => CADASTRAR_BOM
-    """
-
-    if visited is None:
-        visited = set()
-
-    key = (codigo_final, need_qty)
-    if key in visited:
-        return
-    visited.add(key)
-
-    estoque_atual = estoque_map.get(codigo_final, 0)
-
-    if estoque_atual >= need_qty:
-        # não explode
-        return
-
-    faltante = max(0, need_qty - max(0, estoque_atual))
-
-    # se não tem estrutura cadastrada
-    if codigo_final not in bom_simples_map and codigo_final not in bom_kits_map:
-        rows_acao.append({
-            "codigo": codigo_final,
-            "qtd_necessaria": need_qty,
-            "estoque_atual": estoque_atual,
-            "faltante": faltante,
-            "acao": "CADASTRAR_BOM",
-            "observacao": "Sem BOM cadastrada (bom_produto_simples ou bom_kits_conjuntos)."
-        })
-        return
-
-    # se for kit/conjunto (tem componentes)
-    if codigo_final in bom_kits_map:
-        comp_codes = bom_kits_map[codigo_final]["componentes_codigos"]
-        comp_qtds = bom_kits_map[codigo_final]["componentes_qtds"]
-
-        if len(comp_codes) != len(comp_qtds):
-            rows_acao.append({
-                "codigo": codigo_final,
-                "qtd_necessaria": need_qty,
-                "estoque_atual": estoque_atual,
-                "faltante": faltante,
-                "acao": "CADASTRAR_BOM",
-                "observacao": "componentes_codigos e componentes_qtds com tamanhos diferentes."
-            })
-            return
-
-        # explode somente o faltante do kit
-        for cc, qq in zip(comp_codes, comp_qtds):
-            child_need = int(round(faltante * qq))
-            explode_need_for_product(
-                codigo_final=cc,
-                need_qty=child_need,
-                estoque_map=estoque_map,
-                bom_simples_map=bom_simples_map,
-                bom_kits_map=bom_kits_map,
-                rows_insumos=rows_insumos,
-                rows_acao=rows_acao,
-                visited=visited,
-            )
-        return
-
-    # simples => insumos
-    b = bom_simples_map[codigo_final]
-
-    def add_insumo(tipo, codigo_insumo, qtd_por_peca):
-        codigo_insumo = safe_str(codigo_insumo)
-        if not codigo_insumo:
-            return
-
-        qtd_total = int(round(faltante * float(qtd_por_peca)))
-        est = estoque_map.get(codigo_insumo, 0)
-        falt_i = max(0, qtd_total - max(0, est))
-
-        status = "OK" if falt_i == 0 else ("PARCIAL" if est > 0 else "FALTANDO")
-
-        rows_insumos.append({
-            "codigo_pai": codigo_final,
-            "tipo": tipo,
-            "codigo_insumo": codigo_insumo,
-            "qtd_necessaria": qtd_total,
-            "estoque_atual": est,
-            "faltante": falt_i,
-            "observacao": "" if falt_i == 0 else "PLATELEIRA ESTOQUE",
-            "status": status
-        })
-
-        if falt_i > 0:
-            rows_acao.append({
-                "codigo": codigo_insumo,
-                "qtd_necessaria": qtd_total,
-                "estoque_atual": est,
-                "faltante": falt_i,
-                "acao": "FABRICAR",
-                "observacao": f"Insumo necessário para {codigo_final} (faltante do pai = {faltante})."
-            })
-
-    # SEMI
-    add_insumo("SEMI", b.get("semi_codigo", ""), b.get("semi_qtd", 0))
-
-    # GOLA (lista)
-    gola_codes = split_csv_like(b.get("gola_codigo", ""))
-    gola_qtds = split_nums_like(b.get("gola_qtd", ""))
-
-    if gola_codes and gola_qtds and len(gola_codes) == len(gola_qtds):
-        for gc, gq in zip(gola_codes, gola_qtds):
-            add_insumo("GOLA", gc, gq)
-    elif gola_codes and not gola_qtds:
-        # se não veio qtd, assume 1 por item
-        for gc in gola_codes:
-            add_insumo("GOLA", gc, 1)
-    elif gola_codes and gola_qtds and len(gola_codes) != len(gola_qtds):
-        rows_acao.append({
-            "codigo": codigo_final,
-            "qtd_necessaria": need_qty,
-            "estoque_atual": estoque_atual,
-            "faltante": faltante,
-            "acao": "CADASTRAR_BOM",
-            "observacao": "gola_codigo e gola_qtd com tamanhos diferentes."
-        })
-
-    # BORDADO (1)
-    add_insumo("BORDADO", b.get("bordado_codigo", ""), b.get("bordado_qtd", 0))
-
-    # EXTRAS (lista)
-    extras_codes = split_csv_like(b.get("extras_codigos", ""))
-    extras_qtds = split_nums_like(b.get("extras_qtds", ""))
-
-    if extras_codes and extras_qtds and len(extras_codes) == len(extras_qtds):
-        for ec, eq in zip(extras_codes, extras_qtds):
-            add_insumo("EXTRA", ec, eq)
-    elif extras_codes and not extras_qtds:
-        for ec in extras_codes:
-            add_insumo("EXTRA", ec, 1)
-    elif extras_codes and extras_qtds and len(extras_codes) != len(extras_qtds):
-        rows_acao.append({
-            "codigo": codigo_final,
-            "qtd_necessaria": need_qty,
-            "estoque_atual": estoque_atual,
-            "faltante": faltante,
-            "acao": "CADASTRAR_BOM",
-            "observacao": "extras_codigos e extras_qtds com tamanhos diferentes."
-        })
-
-# =========================
-# Main tab
-# =========================
-with tab1:
-    st.subheader("Explosão BOM (Produção)")
-    st.caption("Regra: tendo estoque suficiente do produto final → NÃO explode. Se faltar → explode só o faltante e desce até insumos.")
-
-    st.markdown("### 1) Upload de vendas (CSV/XLSX com colunas de código + quantidade)")
-    sales_file = st.file_uploader("Envie arquivo de vendas", type=["csv", "xlsx"])
-
-    st.markdown("### 2) Fonte de dados (usa o que você salvou em Configuração)")
-    st.info("Dica: vá em ⚙️ Configuração/Diagnóstico e clique em **Salvar configuração** (fica gravado na URL).")
-
-    # pega da URL atual
-    spreadsheet_id = get_q("sid", "")
-    gid_template = parse_gid(get_q("gid_template", ""))
-    gid_simples = parse_gid(get_q("gid_simples", ""))
-    gid_kits = parse_gid(get_q("gid_kits", ""))
-
-    if not spreadsheet_id or not gid_template or not gid_simples or not gid_kits:
-        st.warning("Configuração incompleta. Vá em ⚙️ Configuração/Diagnóstico e salve o Spreadsheet ID + GIDs.")
-        st.stop()
-
-    @st.cache_data(show_spinner=False, ttl=300)
-    def read_google_sheet(spreadsheet_id: str, gid: str) -> pd.DataFrame:
-        url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=csv&gid={gid}"
-        return pd.read_csv(url)
-
-    def normalize_df_columns(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df.columns = [norm_col(c) for c in df.columns]
-        return df
-
-    # lê sheets
-    try:
-        df_stock = normalize_df_columns(read_google_sheet(spreadsheet_id, gid_template))
-        df_simple = normalize_df_columns(read_google_sheet(spreadsheet_id, gid_simples))
-        df_kits = normalize_df_columns(read_google_sheet(spreadsheet_id, gid_kits))
+        payload = {
+            'action': 'movimentar',
+            'codigo': codigo,
+            'quantidade': safe_int(quantidade, 0),
+            'tipo': tipo,
+            'colaborador': colaborador
+        }
+        r = requests.post(WEBHOOK_URL, json=payload, timeout=20)
+        return r.json()
     except Exception as e:
-        st.error(f"Falha ao ler Google Sheets: {e}")
-        st.info("Se deu HTTP 400/403: verifique se a planilha está acessível/publicada para leitura por link.")
-        st.stop()
+        return {'success': False, 'message': f'Erro: {str(e)}'}
 
-    # valida colunas essenciais
-    if "codigo" not in df_stock.columns or "estoque_atual" not in df_stock.columns:
-        st.error("template_estoque precisa ter colunas: codigo, estoque_atual")
-        st.stop()
+def append_bom_rows(destino: str, codigos: list[str], colaborador: str, test_mode=False):
+    """
+    destino: 'simples' ou 'kits'
+    codigos: lista de códigos
+    """
+    if test_mode:
+        return {'success': True, 'message': f'(TESTE) Simulado append {destino}', 'inserted': len(codigos), 'skipped': 0}
 
-    # mapa estoque
-    df_stock["estoque_atual"] = pd.to_numeric(df_stock["estoque_atual"], errors="coerce").fillna(0).astype(int)
-    estoque_map = dict(zip(df_stock["codigo"].astype(str), df_stock["estoque_atual"]))
-
-    # mapas BOM
-    bom_simples_map = {}
-    for _, r in df_simple.iterrows():
-        cf = safe_str(r.get("codigo_final", ""))
-        if not cf:
-            continue
-        bom_simples_map[cf] = {
-            "semi_codigo": safe_str(r.get("semi_codigo", "")),
-            "semi_qtd": pd.to_numeric(r.get("semi_qtd", 0), errors="coerce") if safe_str(r.get("semi_qtd", "")) != "" else 0,
-            "gola_codigo": safe_str(r.get("gola_codigo", "")),
-            "gola_qtd": safe_str(r.get("gola_qtd", "")),
-            "bordado_codigo": safe_str(r.get("bordado_codigo", "")),
-            "bordado_qtd": pd.to_numeric(r.get("bordado_qtd", 0), errors="coerce") if safe_str(r.get("bordado_qtd", "")) != "" else 0,
-            "extras_codigos": safe_str(r.get("extras_codigos", "")),
-            "extras_qtds": safe_str(r.get("extras_qtds", "")),
+    try:
+        payload = {
+            'action': 'append_bom',
+            'spreadsheet_id': SPREADSHEET_ID,
+            'destino': destino,  # 'simples' | 'kits'
+            'codigos': codigos,
+            'colaborador': colaborador,
+            'gid_simples': str(GID_BOM_SIMPLES),
+            'gid_kits': str(GID_BOM_KITS),
+            'timestamp': f"{datetime.now():%Y-%m-%d %H:%M:%S}"
         }
+        r = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+        return r.json()
+    except Exception as e:
+        return {'success': False, 'message': f'Erro: {str(e)}'}
 
-    bom_kits_map = {}
-    for _, r in df_kits.iterrows():
-        cf = safe_str(r.get("codigo_final", ""))
-        if not cf:
-            continue
-        bom_kits_map[cf] = {
-            "componentes_codigos": split_csv_like(r.get("componentes_codigos", "")),
-            "componentes_qtds": split_nums_like(r.get("componentes_qtds", "")),
-        }
+# ======================
+# LOAD PRODUTOS (template_estoque)
+# ======================
+@st.cache_data(ttl=30)
+def carregar_produtos():
+    try:
+        r = requests.get(SHEETS_URL, timeout=20)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text))
 
-    if sales_file is None:
-        st.stop()
+        req = ['codigo', 'nome', 'categoria', 'estoque_atual', 'estoque_min', 'estoque_max']
+        for c in req:
+            if c not in df.columns:
+                if c == 'estoque_max':
+                    df[c] = df.get('estoque_min', 0) * 2
+                else:
+                    df[c] = 0
 
-    # lê vendas
-    if sales_file.name.lower().endswith(".csv"):
-        vendas = pd.read_csv(sales_file)
+        df['estoque_atual'] = pd.to_numeric(df['estoque_atual'], errors='coerce').fillna(0)
+        df['estoque_min']   = pd.to_numeric(df['estoque_min'], errors='coerce').fillna(0)
+        df['estoque_max']   = pd.to_numeric(df['estoque_max'], errors='coerce').fillna(0)
+
+        for c in ['componentes', 'quantidades', 'eh_kit']:
+            if c not in df.columns:
+                df[c] = ''
+            else:
+                df[c] = df[c].astype(str).fillna('')
+
+        df['codigo_key'] = df['codigo'].astype(str).map(normalize_key)
+        return df
+    except Exception as e:
+        st.error(f"Erro ao carregar dados: {e}")
+        return pd.DataFrame()
+
+def calcular_semaforo(estoque_atual, estoque_min, estoque_max):
+    if estoque_atual < estoque_min:
+        return "🔴", "CRÍTICO", "#ff4444"
+    elif estoque_atual <= estoque_min * 1.2:
+        return "🟠", "BAIXO", "#ffaa00"
+    elif estoque_atual > estoque_max:
+        return "🔵", "EXCESSO", "#0088ff"
     else:
-        vendas = pd.read_excel(sales_file)
+        return "🟢", "OK", "#00aa00"
 
-    vendas_norm, code_col, qty_col = detect_sales_columns(vendas)
+def expandir_kits(df_fatura, produtos_df):
+    key_to_code = dict(zip(produtos_df['codigo_key'], produtos_df['codigo'].astype(str)))
 
-    if code_col is None or qty_col is None:
-        st.error(f"Não consegui detectar colunas de código/quantidade no upload. Colunas encontradas: {list(vendas_norm.columns)}")
-        st.stop()
+    kits = {}
+    for _, row in produtos_df.iterrows():
+        if str(row.get('eh_kit', '')).strip().lower() == 'sim':
+            kit_key = row['codigo_key']
+            comps = [normalize_key(c.strip()) for c in str(row.get('componentes', '')).split(',') if c.strip()]
+            quants = parse_int_list(row.get('quantidades', ''))
+            if comps and quants and len(comps) == len(quants):
+                kits[kit_key] = list(zip(comps, quants))
 
-    vendas_norm[code_col] = vendas_norm[code_col].astype(str).str.strip()
-    vendas_norm[qty_col] = pd.to_numeric(vendas_norm[qty_col], errors="coerce").fillna(0).astype(int)
+    if not kits:
+        df_f = df_fatura.copy()
+        df_f['codigo_key'] = df_f['codigo'].map(normalize_key)
+        df_f['codigo_canonical'] = df_f['codigo_key'].map(lambda k: key_to_code.get(k, ''))
+        df_f['codigo'] = df_f['codigo_canonical'].where(df_f['codigo_canonical'] != '', df_f['codigo'])
+        return df_f
 
-    vendas_grp = vendas_norm.groupby(code_col, as_index=False)[qty_col].sum()
-    vendas_grp.columns = ["codigo", "quantidade"]
+    linhas = []
+    for _, row in df_fatura.iterrows():
+        qty = safe_int(row.get('quantidade', 0), 0)
+        code_key = normalize_key(row['codigo'])
+        if code_key in kits:
+            for comp_key, comp_qty in kits[code_key]:
+                linhas.append({'codigo_key': comp_key, 'quantidade': qty * safe_int(comp_qty, 0)})
+        else:
+            linhas.append({'codigo_key': code_key, 'quantidade': qty})
 
-    st.markdown("### 3) Rodar explosão")
-    if st.button("🚀 Explodir BOM e gerar relatório", use_container_width=True):
-        rows_insumos = []
-        rows_acao = []
+    df = pd.DataFrame(linhas).groupby('codigo_key', as_index=False)['quantidade'].sum()
+    df['codigo_canonical'] = df['codigo_key'].map(lambda k: key_to_code.get(k, ''))
+    df['codigo'] = df['codigo_canonical'].where(df['codigo_canonical'] != '', df['codigo_key'])
+    return df
 
-        # explode cada item vendido
-        for _, r in vendas_grp.iterrows():
-            cod = safe_str(r["codigo"])
-            qty = int(r["quantidade"])
-            if not cod or qty <= 0:
-                continue
+def processar_faturamento(arquivo_upload, produtos_df):
+    try:
+        nome = arquivo_upload.name.lower()
+        if nome.endswith('.csv'):
+            df_fatura = None
+            for enc in ['utf-8', 'utf-8-sig', 'latin1', 'iso-8859-1', 'cp1252', 'windows-1252']:
+                try:
+                    arquivo_upload.seek(0)
+                    df_tmp = pd.read_csv(arquivo_upload, encoding=enc)
+                    if df_tmp is not None and len(df_tmp.columns) > 0:
+                        df_fatura = df_tmp
+                        break
+                except:
+                    continue
+            if df_fatura is None:
+                return None, None, "Não foi possível ler o CSV (tente salvar como UTF-8)."
+        elif nome.endswith('.xlsx'):
+            df_fatura = pd.read_excel(arquivo_upload, engine='openpyxl')
+        elif nome.endswith('.xls'):
+            df_fatura = pd.read_excel(arquivo_upload, engine='xlrd')
+        else:
+            return None, None, "Formato não suportado (use CSV/XLS/XLSX)."
 
-            explode_need_for_product(
-                codigo_final=cod,
-                need_qty=qty,
-                estoque_map=estoque_map,
-                bom_simples_map=bom_simples_map,
-                bom_kits_map=bom_kits_map,
-                rows_insumos=rows_insumos,
-                rows_acao=rows_acao,
-            )
+        def normcol(n):
+            n = unicodedata.normalize('NFKD', str(n)).encode('ASCII', 'ignore').decode('ASCII')
+            return n.lower().strip()
+        df_fatura.rename(columns={c: normcol(c) for c in df_fatura.columns}, inplace=True)
 
-        df_ins = pd.DataFrame(rows_insumos)
-        df_act = pd.DataFrame(rows_acao)
+        if 'codigo' not in df_fatura.columns:
+            return None, None, f"Arquivo sem coluna 'Código'. Colunas: {list(df_fatura.columns)}"
+        if 'quantidade' not in df_fatura.columns:
+            return None, None, f"Arquivo sem coluna 'Quantidade'. Colunas: {list(df_fatura.columns)}"
 
-        if df_ins.empty:
-            df_ins = pd.DataFrame(columns=["codigo_pai","tipo","codigo_insumo","qtd_necessaria","estoque_atual","faltante","observacao","status"])
+        df_fatura['codigo'] = df_fatura['codigo'].astype(str).str.strip()
+        df_fatura['quantidade'] = df_fatura['quantidade'].apply(lambda x: safe_int(x, 0)).astype(int)
+        df_fatura = df_fatura[(df_fatura['codigo'] != '') & (df_fatura['quantidade'] > 0)]
+        df_fatura = df_fatura.groupby('codigo', as_index=False)['quantidade'].sum().reset_index(drop=True)
 
-        if df_act.empty:
-            df_act = pd.DataFrame(columns=["codigo","qtd_necessaria","estoque_atual","faltante","acao","observacao"])
+        df_fatura = expandir_kits(df_fatura, produtos_df)
+        if 'codigo_key' not in df_fatura.columns:
+            df_fatura['codigo_key'] = df_fatura['codigo'].map(normalize_key)
 
-        # ordenação: faltantes desc
-        df_act["faltante"] = pd.to_numeric(df_act["faltante"], errors="coerce").fillna(0).astype(int)
-        df_act = df_act.sort_values(["acao","faltante"], ascending=[True, False])
+        estoque_keys = set(produtos_df['codigo_key'])
+        df_fatura['encontrado'] = df_fatura['codigo_key'].isin(estoque_keys)
 
-        df_ins["faltante"] = pd.to_numeric(df_ins["faltante"], errors="coerce").fillna(0).astype(int)
-        df_ins = df_ins.sort_values(["status","faltante"], ascending=[True, False])
+        est_map = {}
+        for _, r in produtos_df.iterrows():
+            k = r['codigo_key']
+            est_map[k] = {'nome': r.get('nome', 'N/A'), 'estoque_atual': pd.to_numeric(r.get('estoque_atual', 0), errors='coerce'), 'codigo': r.get('codigo', '')}
 
-        # aba 01_RESUMO (quantos codigos das vendas, quantos com BOM, quantos sem BOM)
-        cod_vendas = set(vendas_grp["codigo"].astype(str))
-        cod_com_bom = {c for c in cod_vendas if (c in bom_simples_map or c in bom_kits_map)}
-        cod_sem_bom = sorted(list(cod_vendas - cod_com_bom))
+        prods_ok = df_fatura[df_fatura['encontrado']].copy().reset_index(drop=True)
+        if not prods_ok.empty:
+            prods_ok['nome'] = prods_ok['codigo_key'].map(lambda k: est_map[k]['nome'])
+            prods_ok['estoque_atual'] = prods_ok['codigo_key'].map(lambda k: est_map[k]['estoque_atual']).fillna(0)
+            prods_ok['codigo_canonical'] = prods_ok['codigo_key'].map(lambda k: est_map[k]['codigo']).fillna(prods_ok['codigo'])
+            prods_ok['estoque_atual'] = pd.to_numeric(prods_ok['estoque_atual'], errors='coerce').fillna(0)
+            prods_ok['quantidade'] = pd.to_numeric(prods_ok['quantidade'], errors='coerce').fillna(0)
+            prods_ok['estoque_final'] = prods_ok['estoque_atual'] - prods_ok['quantidade']
 
-        df_resumo = pd.DataFrame({
-            "metrica": ["itens_unicos_vendas","itens_com_bom","itens_sem_bom"],
-            "valor": [len(cod_vendas), len(cod_com_bom), len(cod_sem_bom)]
-        })
+        prods_nok = df_fatura[~df_fatura['encontrado']].copy().reset_index(drop=True)
+        if not prods_nok.empty:
+            prods_nok = prods_nok[['codigo', 'quantidade', 'codigo_key']]
 
-        df_sem_bom = pd.DataFrame({"codigo_sem_bom": cod_sem_bom})
+        return prods_ok, prods_nok, None
+    except Exception as e:
+        return None, None, f"Erro ao processar: {str(e)}"
 
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = bytes_xlsx({
-            "01_RESUMO": df_resumo,
-            "02_SEM_BOM": df_sem_bom,
-            "03_INSUMOS": df_ins,
-            "04_LISTA_ACAO": df_act
-        })
+# ======================
+# UI STYLE
+# ======================
+st.markdown("""
+<style>
+.metric-card{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:.9rem;border-radius:10px;color:#fff;text-align:center;margin:.5rem 0}
+.status-card{padding:.8rem;border-radius:8px;margin:.3rem 0;border-left:4px solid}
+.critico{border-color:#ff4444;background:#ffe6e6}
+.baixo{border-color:#ffaa00;background:#fff8e6}
+.ok{border-color:#00aa00;background:#e6ffe6}
+.excesso{border-color:#0088ff;background:#e6f3ff}
+.cockpit-header{background:linear-gradient(90deg,#1e3c72 0%,#2a5298 100%);color:#fff;padding:1rem;border-radius:10px;text-align:center;margin-bottom:1rem}
+.warning-box{background:#fff3cd;border-left:4px solid #ffc107;padding:1rem;border-radius:5px;margin:1rem 0}
+.success-box{background:#d4edda;border-left:4px solid #28a745;padding:1rem;border-radius:5px;margin:1rem 0}
+.error-box{background:#f8d7da;border-left:4px solid #dc3545;padding:1rem;border-radius:5px;margin:1rem 0}
+</style>
+""", unsafe_allow_html=True)
 
-        st.success("Relatório gerado ✅")
-        st.download_button(
-            "⬇️ Baixar relatório Excel",
-            data=out,
-            file_name=f"relatorio_bom_{ts}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+st.markdown("""
+<div class="cockpit-header">
+  <h1>COCKPIT DE CONTROLE — SILVA HOLDING</h1>
+  <p>"Se parar para sentir o perfume das rosas, vem um caminhão e te atropela."</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ======================
+# DATA
+# ======================
+produtos_df = carregar_produtos()
+if produtos_df.empty:
+    st.error("Não foi possível carregar os dados.")
+    st.stop()
+
+produtos_df['semaforo'], produtos_df['status'], produtos_df['cor'] = zip(*produtos_df.apply(
+    lambda r: calcular_semaforo(r['estoque_atual'], r['estoque_min'], r['estoque_max']), axis=1
+))
+produtos_df['falta_para_min']   = (produtos_df['estoque_min'] - produtos_df['estoque_atual']).clip(lower=0)
+produtos_df['falta_para_max']   = (produtos_df['estoque_max'] - produtos_df['estoque_atual']).clip(lower=0)
+produtos_df['excesso_sobre_max']= (produtos_df['estoque_atual'] - produtos_df['estoque_max']).clip(lower=0)
+produtos_df['diferenca_min_max']= produtos_df['estoque_max'] - produtos_df['estoque_min']
+
+# ======================
+# SIDEBAR
+# ======================
+st.sidebar.header("🎛️ CONTROLES DE VOO")
+test_mode = st.sidebar.checkbox("✏️ Modo Teste (simulação)", value=False)
+st.sidebar.info("Quando Modo Teste está ativo, nada é escrito na planilha. Só simula.")
+
+categorias = ['Todas'] + sorted(produtos_df['categoria'].unique().tolist())
+categoria_filtro = st.sidebar.selectbox("📂 Categoria", categorias)
+
+status_opcoes = ['Todos', 'CRÍTICO', 'BAIXO', 'OK', 'EXCESSO']
+status_filtro = st.sidebar.selectbox("🚦 Status", status_opcoes)
+
+tipo_analise = st.sidebar.radio(
+    "Tipo de Análise",
+    ["Visão Geral", "Análise Mín/Máx", "Movimentação", "Baixa por Faturamento", "Relatório de Faltantes"]
+)
+
+df_filtrado = produtos_df.copy()
+if categoria_filtro != 'Todas':
+    df_filtrado = df_filtrado[df_filtrado['categoria'] == categoria_filtro]
+if status_filtro != 'Todos':
+    df_filtrado = df_filtrado[df_filtrado['status'] == status_filtro]
+
+# ======================
+# VISÃO GERAL
+# ======================
+if tipo_analise == "Visão Geral":
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1: st.markdown(f"""<div class="metric-card"><h3>PRODUTOS</h3><h2>{len(df_filtrado)}</h2></div>""", unsafe_allow_html=True)
+    with col2: st.markdown(f"""<div class="metric-card"><h3>ESTOQUE TOTAL</h3><h2>{int(df_filtrado['estoque_atual'].sum()):,}</h2></div>""", unsafe_allow_html=True)
+    with col3: st.markdown(f"""<div class="metric-card"><h3>CRÍTICOS</h3><h2>{len(df_filtrado[df_filtrado['status']=='CRÍTICO'])}</h2></div>""", unsafe_allow_html=True)
+    with col4: st.markdown(f"""<div class="metric-card"><h3>BAIXOS</h3><h2>{len(df_filtrado[df_filtrado['status']=='BAIXO'])}</h2></div>""", unsafe_allow_html=True)
+    with col5: st.markdown(f"""<div class="metric-card"><h3>OK</h3><h2>{len(df_filtrado[df_filtrado['status']=='OK'])}</h2></div>""", unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Distribuição por Status")
+        vc = df_filtrado['status'].value_counts()
+        st.plotly_chart(
+            px.pie(values=vc.values, names=vc.index).update_layout(height=320),
             use_container_width=True
         )
+    with c2:
+        st.subheader("Estoque por Categoria")
+        cat = df_filtrado.groupby('categoria')['estoque_atual'].sum().sort_values(ascending=False)
+        st.plotly_chart(px.bar(x=cat.index, y=cat.values).update_layout(height=320, showlegend=False),
+                        use_container_width=True)
 
-        st.markdown("### Prévia rápida")
-        st.write("Ações (top 30):")
-        st.dataframe(df_act.head(30), use_container_width=True)
+# ======================
+# ANÁLISE MÍN/MÁX
+# ======================
+elif tipo_analise == "Análise Mín/Máx":
+    st.subheader("Análise Estoque Mínimo/Máximo")
+    c1, c2 = st.columns(2)
+    with c1:
+        analise_tipo = st.selectbox("Tipo de Análise", ["Falta para Mínimo", "Falta para Máximo", "Excesso sobre Máximo", "Diferença Mín-Máx"])
+    with c2:
+        only_diff = st.checkbox("Mostrar apenas com diferença > 0", value=True)
 
-        st.write("Insumos (top 30):")
-        st.dataframe(df_ins.head(30), use_container_width=True)
+    df_ = df_filtrado.copy()
+    if analise_tipo == "Falta para Mínimo":
+        col = 'falta_para_min'; titulo = 'Falta p/ Mín'
+        if only_diff: df_ = df_[df_['falta_para_min'] > 0]
+    elif analise_tipo == "Falta para Máximo":
+        col = 'falta_para_max'; titulo = 'Falta p/ Máx'
+        if only_diff: df_ = df_[df_['falta_para_max'] > 0]
+    elif analise_tipo == "Excesso sobre Máximo":
+        col = 'excesso_sobre_max'; titulo = 'Excesso s/ Máx'
+        if only_diff: df_ = df_[df_['excesso_sobre_max'] > 0]
+    else:
+        col = 'diferenca_min_max'; titulo = 'Diferença Mín-Máx'
+        if only_diff: df_ = df_[df_['diferenca_min_max'] > 0]
+
+    if df_.empty:
+        st.info("Sem resultados para os filtros.")
+    else:
+        tbl = df_[['codigo','nome','categoria','estoque_atual','estoque_min','estoque_max',col,'status']].rename(
+            columns={'estoque_atual':'Atual','estoque_min':'Mínimo','estoque_max':'Máximo', col:titulo, 'status':'Status', 'codigo':'Código','nome':'Produto','categoria':'Categoria'}
+        )
+        for c in ['Atual','Mínimo','Máximo',titulo]:
+            tbl[c] = pd.to_numeric(tbl[c], errors='coerce').fillna(0).astype(int)
+        st.dataframe(tbl.sort_values(titulo, ascending=False), use_container_width=True, height=520)
+
+# ======================
+# MOVIMENTAÇÃO
+# ======================
+elif tipo_analise == "Movimentação":
+    st.subheader("Movimentação de Estoque")
+    colaborador = st.selectbox("👤 Colaborador", ['Pericles','Maria','Camila','Cris VantiStella'])
+    busca = st.text_input("🔍 Buscar", placeholder="Código ou nome...")
+    if not busca or len(busca) < 2:
+        st.info("Digite pelo menos 2 caracteres.")
+    else:
+        found = df_filtrado[
+            df_filtrado['codigo'].str.contains(busca, case=False, na=False) |
+            df_filtrado['nome'].str.contains(busca, case=False, na=False)
+        ]
+        if found.empty:
+            st.warning("Nada encontrado.")
+        else:
+            for _, p in found.head(10).iterrows():
+                with st.expander(f"{p['semaforo']} {p['codigo']} — {p['nome']}"):
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.metric("Atual", f"{int(p['estoque_atual'])}")
+                        st.metric("Mín", f"{int(p['estoque_min'])}")
+                        st.metric("Máx", f"{int(p['estoque_max'])}")
+                    with c2:
+                        qtd_e = st.number_input("Quantidade (Entrada)", min_value=1, value=1, key=f"ent_{p['codigo']}")
+                        if st.button("+ Entrada", key=f"btn_ent_{p['codigo']}"):
+                            r = movimentar_estoque(p['codigo'], qtd_e, 'entrada', colaborador, test_mode=test_mode)
+                            st.success(f"{r.get('message','OK')} | Novo estoque: {r.get('novo_estoque')}")
+                            if not test_mode and r.get('success'):
+                                st.cache_data.clear(); st.rerun()
+                    with c3:
+                        max_s = max(1, int(p['estoque_atual']))
+                        qtd_s = st.number_input("Quantidade (Saída)", min_value=1, max_value=max_s, value=1, key=f"sai_{p['codigo']}")
+                        if st.button("- Saída", key=f"btn_sai_{p['codigo']}"):
+                            r = movimentar_estoque(p['codigo'], qtd_s, 'saida', colaborador, test_mode=test_mode)
+                            st.success(f"{r.get('message','OK')} | Novo estoque: {r.get('novo_estoque')}")
+                            if not test_mode and r.get('success'):
+                                st.cache_data.clear(); st.rerun()
+
+# ======================
+# BAIXA POR FATURAMENTO + BOTÃO ENVIAR PARA BOM
+# ======================
+elif tipo_analise == "Baixa por Faturamento":
+    st.subheader("Baixa por Faturamento")
+    st.markdown("""
+    <div class="success-box">
+      <strong>Fluxo:</strong><br>
+      1) Upload (CSV/XLS/XLSX com <em>Código</em> e <em>Quantidade</em>)<br>
+      2) Preview (encontrados x não encontrados)<br>
+      3) (Opcional) Enviar não encontrados para BOM<br>
+      4) Aplicar baixa (se quiser)
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.info("Modo Teste está **{}**.".format("ATIVO (simulação)" if test_mode else "DESATIVADO (vai alterar planilha)"))
+    colaborador_fatura = st.selectbox("👤 Colaborador responsável", ['Pericles','Maria','Camila','Cris VantiStella'], key="colab_fatura")
+    arquivo = st.file_uploader("📁 Arquivo de faturamento", type=['csv','xls','xlsx'])
+
+    if arquivo:
+        with st.spinner("Processando arquivo..."):
+            ok, nok, err = processar_faturamento(arquivo, produtos_df)
+
+        if err:
+            st.error(err)
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1: st.metric("Total de Linhas", len(ok)+len(nok))
+            with c2: st.metric("Produtos Encontrados", len(ok))
+            with c3: st.metric("Não Encontrados", len(nok))
+
+            # ---------- NÃO ENCONTRADOS + BOTÃO ENVIAR PARA BOM ----------
+            if not nok.empty:
+                st.markdown("""<div class="error-box"><b>ATENÇÃO:</b> Códigos não encontrados no estoque.</div>""", unsafe_allow_html=True)
+                tbl_nok = nok[['codigo','quantidade','codigo_key']].rename(columns={'codigo':'Código','quantidade':'Quantidade','codigo_key':'Chave Normalizada'})
+                st.dataframe(tbl_nok, use_container_width=True, height=260)
+
+                st.markdown("### ✅ Resolver agora: criar linhas no BOM com placeholders")
+                destino = st.radio(
+                    "Onde você quer cadastrar esses códigos?",
+                    ["Produto simples (bom_produto_simples)", "Kit/Conjunto (bom_kits_conjuntos)"],
+                    horizontal=False
+                )
+
+                cods = tbl_nok['Código'].astype(str).str.strip().tolist()
+                cods = [c for c in cods if c]
+
+                if st.button("📌 ENVIAR PARA BOM (criar linhas vazias)", type="primary", use_container_width=True):
+                    dest_key = "simples" if destino.startswith("Produto simples") else "kits"
+                    res = append_bom_rows(dest_key, cods, colaborador_fatura, test_mode=test_mode)
+                    if res.get('success'):
+                        st.success(f"OK. Inseridos: {res.get('inserted',0)} | Já existiam: {res.get('skipped',0)}")
+                        st.info("Agora é só ir na planilha e preencher Componentes/Quantidades/Nomes.")
+                    else:
+                        st.error(res.get('message', 'Falha ao enviar para BOM'))
+
+            # ---------- PREVIEW ENCONTRADOS ----------
+            if not ok.empty:
+                st.markdown("---"); st.subheader("Preview da Baixa")
+                prev = ok[['codigo_canonical','nome','estoque_atual','quantidade','estoque_final']].copy()
+                prev.columns = ['Código','Produto','Estoque Atual','Qtd a Baixar','Estoque Final']
+                for c in ['Estoque Atual','Qtd a Baixar','Estoque Final']:
+                    prev[c] = pd.to_numeric(prev[c], errors='coerce').fillna(0).astype(int)
+                prev['Status'] = prev['Estoque Final'].apply(lambda x: 'Negativo' if x < 0 else ('Zerado' if x == 0 else 'OK'))
+                st.dataframe(prev, use_container_width=True, height=520)
+
+                label_btn = "🧪 SIMULAR baixas (modo teste)" if test_mode else "✅ APLICAR baixas (alterar planilha)"
+                if st.button(label_btn, type="secondary", use_container_width=True):
+                    sucesso, erro = 0, 0
+                    prog = st.progress(0); txt = st.empty()
+                    total = len(ok)
+                    for i, row in ok.iterrows():
+                        txt.text(f"Processando {i+1}/{total}: {row.get('codigo_canonical', row['codigo'])}")
+                        res = movimentar_estoque(row.get('codigo_canonical', row['codigo']),
+                                                 row['quantidade'], 'saida', colaborador_fatura, test_mode=test_mode)
+                        if res.get('success'):
+                            sucesso += 1
+                        else:
+                            erro += 1
+                        prog.progress((i+1)/total)
+                    prog.empty(); txt.empty()
+                    st.success(f"Concluído. Sucessos: {sucesso} | Erros: {erro}")
+                    if not test_mode:
+                        st.cache_data.clear(); st.rerun()
+
+# ======================
+# RELATÓRIO DE FALTANTES
+# ======================
+elif tipo_analise == "Relatório de Faltantes":
+    st.subheader("Relatório de Produtos Faltantes")
+    st.markdown("""<div class="warning-box">
+    Upload vendas (Código/Quantidade). O app expande kits e checa estoque.
+    </div>""", unsafe_allow_html=True)
+    st.file_uploader("📁 Arquivo de vendas", type=['csv','xls','xlsx'], key="faltantes_up")
+
+st.markdown("---")
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("🔄 Atualizar Dados"):
+        st.cache_data.clear(); st.rerun()
+with c2:
+    st.write(f"**Última atualização:** {datetime.now():%H:%M:%S}")
